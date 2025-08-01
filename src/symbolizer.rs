@@ -272,7 +272,7 @@ impl Symbolizer {
             if !pathname.is_empty() && !pathname.starts_with('[') {
                 // This is a shared library - load it if we haven't already
                 if let Err(e) = self.load_library(&pathname, base_addr) {
-                    eprintln!("Failed to load library {}: {e}", pathname);
+                    eprintln!("Failed to load library {pathname}: {e}");
                 }
                 
                 // Try to symbolize using the library
