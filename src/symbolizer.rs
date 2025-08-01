@@ -24,7 +24,7 @@ impl Symbolizer {
         // Find the base address from /proc/PID/maps
         let base_address = Self::find_base_address(pid, executable_path)?;
         
-        println!("Symbolizer: Found base address 0x{:x} for {}", base_address, executable_path);
+        println!("Symbolizer: Found base address 0x{base_address:x} for {executable_path}");
         
         // Start addr2line process
         let process = Command::new("addr2line")
@@ -50,7 +50,7 @@ impl Symbolizer {
     }
     
     fn find_base_address(pid: i32, executable_path: &str) -> Result<u64, Box<dyn std::error::Error>> {
-        let maps_path = format!("/proc/{}/maps", pid);
+        let maps_path = format!("/proc/{pid}/maps");
         let file = File::open(&maps_path)?;
         let reader = BufReader::new(file);
         
@@ -59,16 +59,15 @@ impl Symbolizer {
             let line = line?;
             if let Some(mapping) = Self::parse_memory_mapping(&line) {
                 // Look for the main executable (usually the first executable mapping)
-                if mapping.pathname.contains("exe") || mapping.pathname == executable_path {
-                    if mapping.offset == 0 {  // First mapping of the executable
+                if (mapping.pathname.contains("exe") || mapping.pathname == executable_path)
+                    && mapping.offset == 0 {  // First mapping of the executable
                         return Ok(mapping.start);
                     }
-                }
             }
         }
         
         // Fallback: if we can't find it, assume no offset needed
-        eprintln!("Warning: Could not find base address for {}, assuming 0", executable_path);
+        eprintln!("Warning: Could not find base address for {executable_path}, assuming 0");
         Ok(0)
     }
     
@@ -125,15 +124,15 @@ impl Symbolizer {
             
             if let (Some(stdin), Some(stdout)) = (process.stdin.as_mut(), process.stdout.as_mut()) {
                 // Send the address
-                if let Err(e) = writeln!(stdin, "0x{:x}", file_address) {
-                    eprintln!("Failed to write address to addr2line: {}", e);
-                    result.function_name = Some(format!("<unknown_{:x}>", address));
+                if let Err(e) = writeln!(stdin, "0x{file_address:x}") {
+                    eprintln!("Failed to write address to addr2line: {e}");
+                    result.function_name = Some(format!("<unknown_{address:x}>"));
                     return result;
                 }
                 
                 if let Err(e) = stdin.flush() {
-                    eprintln!("Failed to flush stdin to addr2line: {}", e);
-                    result.function_name = Some(format!("<unknown_{:x}>", address));
+                    eprintln!("Failed to flush stdin to addr2line: {e}");
+                    result.function_name = Some(format!("<unknown_{address:x}>"));
                     return result;
                 }
 
@@ -141,7 +140,7 @@ impl Symbolizer {
                 let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
                 
-                if let Ok(_) = reader.read_line(&mut line) {
+                if reader.read_line(&mut line).is_ok() {
                     let line = line.trim();
                     
                     // Parse the response format: "function at file:line" or "?? ??:0"
@@ -174,7 +173,7 @@ impl Symbolizer {
                         }
                     }
                 } else {
-                    eprintln!("Failed to read response from addr2line for address: 0x{:x}", address);
+                    eprintln!("Failed to read response from addr2line for address: 0x{address:x}");
                 }
             } else {
                 eprintln!("addr2line process pipes not available");
@@ -185,7 +184,7 @@ impl Symbolizer {
 
         // If still no function name, provide a fallback
         if result.function_name.is_none() {
-            result.function_name = Some(format!("<unknown_{:x}>", address));
+            result.function_name = Some(format!("<unknown_{address:x}>"));
         }
 
         result
