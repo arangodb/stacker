@@ -8,7 +8,7 @@ A multi-architecture stack tracer for Linux processes that supports both x86_64 
 - **Thread discovery**: Automatically finds and traces all threads in a target process
 - **Register dumping**: Shows architecture-specific CPU registers for each thread
 - **Stack unwinding**: Walks the call stack using architecture-appropriate methods
-- **Symbol resolution**: Resolves addresses to function names, file names, and line numbers using `addr2line`
+- **Symbol resolution**: Resolves addresses to function names, file names, and line numbers using built-in DWARF parsing
 - **Minimal process interruption**: Quickly captures stack traces and detaches to minimize impact
 
 ## Supported Architectures
@@ -19,7 +19,6 @@ A multi-architecture stack tracer for Linux processes that supports both x86_64 
 ## Dependencies
 
 - Linux kernel with ptrace support
-- `addr2line` utility (from binutils) for symbol resolution
 - Rust toolchain
 
 ## Building
@@ -97,7 +96,7 @@ Symbolizing stack traces...
 2. **Register Capture**: Reads CPU registers from each thread using `PTRACE_GETREGS`
 3. **Stack Walking**: Follows frame pointers to unwind the call stack
 4. **Quick Detachment**: Detaches from all threads to minimize process interruption
-5. **Symbol Resolution**: Uses `addr2line` to resolve addresses to human-readable symbols
+5. **Symbol Resolution**: Uses built-in DWARF parsing to resolve addresses to human-readable symbols
 
 ## Requirements
 
