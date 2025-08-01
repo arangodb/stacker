@@ -7,6 +7,18 @@ use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
 
+// Compile-time architecture verification
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("This program currently supports only x86_64 and aarch64 architectures");
+
+// Architecture info helper
+fn get_architecture_info() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    return "x86_64";
+    #[cfg(target_arch = "aarch64")]
+    return "aarch64";
+}
+
 mod symbolizer;
 use symbolizer::Symbolizer;
 
@@ -25,8 +37,20 @@ struct SymbolizedFrame {
     line_number: Option<u32>,
 }
 
+// Architecture-agnostic register printing
+#[cfg(target_arch = "x86_64")]
+fn print_registers(regs: &user_regs_struct) {
+    print_x86_64_registers(regs);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn print_registers(regs: &user_regs_struct) {
+    print_arm64_registers(regs);
+}
+
+#[cfg(target_arch = "x86_64")]
 fn print_x86_64_registers(regs: &user_regs_struct) {
-    println!("  Registers:");
+    println!("  Registers (x86_64):");
     // General purpose registers
     println!("    RAX: 0x{:016x}  RBX: 0x{:016x}  RCX: 0x{:016x}  RDX: 0x{:016x}", 
              regs.rax, regs.rbx, regs.rcx, regs.rdx);
@@ -49,6 +73,38 @@ fn print_x86_64_registers(regs: &user_regs_struct) {
     println!("    ORIG_RAX: 0x{:016x}", regs.orig_rax);
 }
 
+#[cfg(target_arch = "aarch64")]
+fn print_arm64_registers(regs: &user_regs_struct) {
+    println!("  Registers (ARM64):");
+    // General purpose registers X0-X7
+    println!("    X0:  0x{:016x}  X1:  0x{:016x}  X2:  0x{:016x}  X3:  0x{:016x}", 
+             regs.regs[0], regs.regs[1], regs.regs[2], regs.regs[3]);
+    println!("    X4:  0x{:016x}  X5:  0x{:016x}  X6:  0x{:016x}  X7:  0x{:016x}", 
+             regs.regs[4], regs.regs[5], regs.regs[6], regs.regs[7]);
+    
+    // General purpose registers X8-X15
+    println!("    X8:  0x{:016x}  X9:  0x{:016x}  X10: 0x{:016x}  X11: 0x{:016x}", 
+             regs.regs[8], regs.regs[9], regs.regs[10], regs.regs[11]);
+    println!("    X12: 0x{:016x}  X13: 0x{:016x}  X14: 0x{:016x}  X15: 0x{:016x}", 
+             regs.regs[12], regs.regs[13], regs.regs[14], regs.regs[15]);
+    
+    // General purpose registers X16-X23
+    println!("    X16: 0x{:016x}  X17: 0x{:016x}  X18: 0x{:016x}  X19: 0x{:016x}", 
+             regs.regs[16], regs.regs[17], regs.regs[18], regs.regs[19]);
+    println!("    X20: 0x{:016x}  X21: 0x{:016x}  X22: 0x{:016x}  X23: 0x{:016x}", 
+             regs.regs[20], regs.regs[21], regs.regs[22], regs.regs[23]);
+    
+    // General purpose registers X24-X30
+    println!("    X24: 0x{:016x}  X25: 0x{:016x}  X26: 0x{:016x}  X27: 0x{:016x}", 
+             regs.regs[24], regs.regs[25], regs.regs[26], regs.regs[27]);
+    println!("    X28: 0x{:016x}  X29: 0x{:016x}  X30: 0x{:016x}", 
+             regs.regs[28], regs.regs[29], regs.regs[30]);
+    
+    // Special registers
+    println!("    SP:  0x{:016x}  PC:  0x{:016x}  PSTATE: 0x{:016x}", 
+             regs.sp, regs.pc, regs.pstate);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -57,6 +113,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pid: i32 = args[1].parse()?;
+    println!("Stacker v0.1.0 - Multi-architecture stack tracer");
+    println!("Target architecture: {}", get_architecture_info());
     println!("Attaching to process {pid}");
 
     let start_time = Instant::now();
@@ -80,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     for (i, thread_info) in thread_infos.iter().enumerate() {
         println!("\n=== Thread {} (TID: {}) ===", i + 1, thread_info.tid);
-        print_x86_64_registers(&thread_info.registers);
+        print_registers(&thread_info.registers);
         
         for (frame_idx, &addr) in thread_info.stack_trace.iter().enumerate() {
             let sym_frame = symbolizer.symbolize(addr);
@@ -184,7 +242,19 @@ fn capture_thread_stack_trace(tid: i32) -> Result<ThreadInfo, Box<dyn std::error
     })
 }
 
+// Architecture-agnostic stack walking
+#[cfg(target_arch = "x86_64")]
 fn walk_stack(pid: Pid, registers: &user_regs_struct) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    walk_stack_x86_64(pid, registers)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn walk_stack(pid: Pid, registers: &user_regs_struct) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    walk_stack_arm64(pid, registers)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn walk_stack_x86_64(pid: Pid, registers: &user_regs_struct) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
     let mut stack_trace = Vec::new();
     let rip = registers.rip;
     let mut rbp = registers.rbp;
@@ -214,6 +284,52 @@ fn walk_stack(pid: Pid, registers: &user_regs_struct) -> Result<Vec<u64>, Box<dy
                             break; // Prevent infinite loops
                         }
                         rbp = prev_rbp;
+                    }
+                    Err(_) => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    
+    Ok(stack_trace)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn walk_stack_arm64(pid: Pid, registers: &user_regs_struct) -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+    let mut stack_trace = Vec::new();
+    let pc = registers.pc;           // Program counter (instruction pointer)
+    let mut fp = registers.regs[29]; // Frame pointer (X29 in ARM64)
+    
+    // Add the current instruction pointer
+    stack_trace.push(pc);
+    
+    // Walk the stack frames using ARM64 calling convention
+    // ARM64 stack frame layout:
+    // [FP-16] = previous frame's LR (return address)
+    // [FP-8]  = previous frame's FP
+    // [FP]    = current frame pointer
+    const MAX_FRAMES: usize = 50;
+    for _ in 0..MAX_FRAMES {
+        if fp == 0 {
+            break;
+        }
+        
+        // ARM64: Read the return address from [FP + 8] (link register save location)
+        match read_memory_word(pid, fp + 8) {
+            Ok(return_addr) => {
+                if return_addr == 0 {
+                    break;
+                }
+                stack_trace.push(return_addr);
+                
+                // Read previous frame pointer from [FP]
+                match read_memory_word(pid, fp) {
+                    Ok(prev_fp) => {
+                        if prev_fp <= fp {
+                            break; // Prevent infinite loops
+                        }
+                        fp = prev_fp;
                     }
                     Err(_) => break,
                 }
