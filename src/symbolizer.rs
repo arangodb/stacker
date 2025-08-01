@@ -1,43 +1,50 @@
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::borrow::Cow;
+use std::fs;
+
+use object::{Object, ObjectSection};
 
 use crate::SymbolizedFrame;
 
 pub struct Symbolizer {
-    process: Mutex<Child>,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct MemoryMapping {
-    start: u64,
-    end: u64,
-    offset: u64,
-    pathname: String,
+    context: addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>,
+    _file_data: &'static [u8],
 }
 
 impl Symbolizer {
     pub fn new(executable_path: &str, _pid: i32) -> Result<Self, Box<dyn std::error::Error>> {
-        // Start addr2line process
-        let process = Command::new("addr2line")
-            .arg("-e")
-            .arg(executable_path)
-            .arg("-f") // Include function names
-            .arg("-C") // Demangle C++ names
-            .arg("-p") // Pretty print (more readable format)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        // Read the executable file
+        let file_data = fs::read(executable_path)?;
+        
+        // Leak the file data to get 'static lifetime
+        // This is intentional - we need the data to live for the entire program duration
+        let static_file_data: &'static [u8] = Box::leak(file_data.into_boxed_slice());
+        
+        // Parse the object file
+        let object = object::File::parse(static_file_data)?;
+        
+        // Load debug sections and create DWARF info
+        let endian = if object.is_little_endian() {
+            gimli::RunTimeEndian::Little
+        } else {
+            gimli::RunTimeEndian::Big
+        };
 
-        // Verify process started successfully
-        if process.stdin.is_none() || process.stdout.is_none() {
-            return Err("Failed to create pipes to addr2line process".into());
-        }
+        let load_section = |id: gimli::SectionId| -> Result<gimli::EndianRcSlice<gimli::RunTimeEndian>, gimli::Error> {
+            let data = match object.section_by_name(id.name()) {
+                Some(section) => section.uncompressed_data().unwrap_or(Cow::Borrowed(&[][..])),
+                None => Cow::Borrowed(&[][..]),
+            };
+            Ok(gimli::EndianRcSlice::new(std::rc::Rc::from(&*data), endian))
+        };
+
+        let dwarf = gimli::Dwarf::load(&load_section)?;
+        
+        // Create the addr2line context
+        let context = addr2line::Context::from_dwarf(dwarf)?;
 
         Ok(Symbolizer {
-            process: Mutex::new(process),
+            context,
+            _file_data: static_file_data,
         })
     }
 
@@ -49,71 +56,55 @@ impl Symbolizer {
             line_number: None,
         };
 
-        // Convert virtual address to file offset
-        let file_address = address;
-
-        // Send address to addr2line and read response
-        if let Ok(mut process_guard) = self.process.lock() {
-            let process = &mut *process_guard;
-
-            if let (Some(stdin), Some(stdout)) = (process.stdin.as_mut(), process.stdout.as_mut()) {
-                // Send the address
-                if let Err(e) = writeln!(stdin, "0x{file_address:x}") {
-                    eprintln!("Failed to write address to addr2line: {e}");
-                    result.function_name = Some(format!("<unknown_{address:x}>"));
-                    return result;
+        // Try to find location information for this address
+        match self.context.find_location(address) {
+            Ok(Some(location)) => {
+                // Extract file information
+                if let Some(file) = location.file {
+                    result.file_name = Some(file.to_string());
                 }
-
-                if let Err(e) = stdin.flush() {
-                    eprintln!("Failed to flush stdin to addr2line: {e}");
-                    result.function_name = Some(format!("<unknown_{address:x}>"));
-                    return result;
+                
+                // Extract line number
+                if let Some(line) = location.line {
+                    result.line_number = Some(line);
                 }
+            }
+            Ok(None) => {
+                // No location information found
+            }
+            Err(e) => {
+                eprintln!("Error finding location for address 0x{address:x}: {e}");
+            }
+        }
 
-                // Read the response
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-
-                if reader.read_line(&mut line).is_ok() {
-                    let line = line.trim();
-
-                    // Parse the response format: "function at file:line" or "?? ??:0"
-                    if line.contains(" at ") {
-                        let parts: Vec<&str> = line.splitn(2, " at ").collect();
-                        if parts.len() == 2 {
-                            let function_name = parts[0].trim();
-                            let location = parts[1].trim();
-
-                            // Set function name (skip if it's "??")
-                            if function_name != "??" {
-                                result.function_name = Some(function_name.to_string());
-                            }
-
-                            // Parse file:line
-                            if let Some(colon_pos) = location.rfind(':') {
-                                let file_part = &location[..colon_pos];
-                                let line_part = &location[colon_pos + 1..];
-
-                                if file_part != "??" {
-                                    result.file_name = Some(file_part.to_string());
-                                }
-
-                                if let Ok(line_num) = line_part.parse::<u32>() {
-                                    if line_num > 0 {
-                                        result.line_number = Some(line_num);
-                                    }
-                                }
-                            }
+        // Try to find function information for this address
+        // Use the frames API correctly
+        let frame_iter = self.context.find_frames(address);
+        loop {
+            match frame_iter {
+                addr2line::LookupResult::Output(Ok(mut frames)) => {
+                    if let Ok(Some(frame)) = frames.next() {
+                        if let Some(function) = frame.function {
+                            // Get the raw function name
+                            let raw_name = function.raw_name().unwrap_or(Cow::Borrowed("<unknown>"));
+                            
+                            // Try to demangle the name
+                            let demangled_name = function.demangle().unwrap_or(raw_name);
+                            result.function_name = Some(demangled_name.to_string());
                         }
                     }
-                } else {
-                    eprintln!("Failed to read response from addr2line for address: 0x{address:x}");
+                    break;
+                },
+                addr2line::LookupResult::Output(Err(_e)) => {
+                    // Error occurred, break out
+                    break;
+                },
+                addr2line::LookupResult::Load { load: _, continuation: _ } => {
+                    // This is a lazy loading scenario - we need to call the continuation
+                    // For simplicity, we'll just skip this case and use fallback
+                    break;
                 }
-            } else {
-                eprintln!("addr2line process pipes not available");
             }
-        } else {
-            eprintln!("Failed to lock addr2line process");
         }
 
         // If still no function name, provide a fallback
@@ -122,23 +113,5 @@ impl Symbolizer {
         }
 
         result
-    }
-}
-
-impl Drop for Symbolizer {
-    fn drop(&mut self) {
-        // Clean up the addr2line process
-        if let Ok(mut process_guard) = self.process.lock() {
-            let process = &mut *process_guard;
-
-            // Close stdin to signal the process to exit
-            if let Some(mut stdin) = process.stdin.take() {
-                let _ = stdin.flush();
-                drop(stdin);
-            }
-
-            // Try to terminate the process gracefully
-            let _ = process.wait();
-        }
     }
 }
