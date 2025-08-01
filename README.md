@@ -52,7 +52,8 @@ The program displays:
 1. **Process information**: PID and architecture being traced
 2. **Thread discovery**: Number of threads found
 3. **Timing information**: How long the process was stopped
-4. **Per-thread information**:
+4. **Memory maps**: Process memory layout and loaded libraries
+5. **Per-thread information**:
    - Thread ID (TID)
    - Thread name (from `/proc/{pid}/task/{tid}/comm`)
    - CPU registers (architecture-specific)
