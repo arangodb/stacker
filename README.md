@@ -54,6 +54,7 @@ The program displays:
 3. **Timing information**: How long the process was stopped
 4. **Per-thread information**:
    - Thread ID (TID)
+   - Thread name (from `/proc/{pid}/task/{tid}/comm`)
    - CPU registers (architecture-specific)
    - Stack trace with symbol information
 
@@ -68,7 +69,7 @@ Process was stopped for: 2.345ms
 
 Symbolizing stack traces...
 
-=== Thread 1 (TID: 1234) ===
+=== Thread 1 (TID: 1234, Name: 'main') ===
   Registers (x86_64):
     RAX: 0x00007f8b8c0d4000  RBX: 0x0000000000000000  ...
     

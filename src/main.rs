@@ -25,6 +25,7 @@ use symbolizer::Symbolizer;
 #[derive(Debug, Clone)]
 struct ThreadInfo {
     tid: i32,
+    thread_name: String,
     registers: user_regs_struct,
     stack_trace: Vec<u64>,
 }
@@ -124,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Found {} threads", thread_ids.len());
 
     // Step 2: Attach to all threads and capture stack traces quickly
-    let thread_infos = capture_all_threads(thread_ids)?;
+    let thread_infos = capture_all_threads(pid, thread_ids)?;
     
     let capture_duration = start_time.elapsed();
     println!("Process was stopped for: {capture_duration:?}");
@@ -137,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let symbolizer = Symbolizer::new(&executable_path, pid)?;
     
     for (i, thread_info) in thread_infos.iter().enumerate() {
-        println!("\n=== Thread {} (TID: {}) ===", i + 1, thread_info.tid);
+        println!("\n=== Thread {} (TID: {}, Name: '{}') ===", i + 1, thread_info.tid, thread_info.thread_name);
         print_registers(&thread_info.registers);
         
         for (frame_idx, &addr) in thread_info.stack_trace.iter().enumerate() {
@@ -182,7 +183,7 @@ fn discover_threads(pid: i32) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
     Ok(thread_ids)
 }
 
-fn capture_all_threads(thread_ids: Vec<i32>) -> Result<Vec<ThreadInfo>, Box<dyn std::error::Error>> {
+fn capture_all_threads(pid: i32, thread_ids: Vec<i32>) -> Result<Vec<ThreadInfo>, Box<dyn std::error::Error>> {
     let mut thread_infos = Vec::new();
     let mut attached_tids = Vec::new();
     
@@ -211,7 +212,7 @@ fn capture_all_threads(thread_ids: Vec<i32>) -> Result<Vec<ThreadInfo>, Box<dyn 
     
     // Now quickly capture stack traces for all stopped threads
     for &tid in &attached_tids {
-        if let Ok(thread_info) = capture_thread_stack_trace(tid) {
+        if let Ok(thread_info) = capture_thread_stack_trace(pid, tid) {
             thread_infos.push(thread_info);
         }
     }
@@ -226,8 +227,19 @@ fn capture_all_threads(thread_ids: Vec<i32>) -> Result<Vec<ThreadInfo>, Box<dyn 
     Ok(thread_infos)
 }
 
-fn capture_thread_stack_trace(tid: i32) -> Result<ThreadInfo, Box<dyn std::error::Error>> {
+fn get_thread_name(pid: i32, tid: i32) -> String {
+    let comm_path = format!("/proc/{pid}/task/{tid}/comm");
+    match fs::read_to_string(&comm_path) {
+        Ok(name) => name.trim().to_string(),
+        Err(_) => "<unknown>".to_string(),
+    }
+}
+
+fn capture_thread_stack_trace(main_pid: i32, tid: i32) -> Result<ThreadInfo, Box<dyn std::error::Error>> {
     let pid = Pid::from_raw(tid);
+    
+    // Get thread name using the main process PID and thread ID
+    let thread_name = get_thread_name(main_pid, tid);
     
     // Get registers
     let registers = ptrace::getregs(pid)?;
@@ -237,6 +249,7 @@ fn capture_thread_stack_trace(tid: i32) -> Result<ThreadInfo, Box<dyn std::error
     
     Ok(ThreadInfo {
         tid,
+        thread_name,
         registers,
         stack_trace,
     })
