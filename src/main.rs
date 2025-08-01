@@ -41,14 +41,14 @@ struct SymbolizedFrame {
 }
 
 #[derive(Debug)]
-struct MemoryMapping {
-    start: u64,
-    end: u64,
-    permissions: String,
-    offset: u64,
-    device: String,
-    inode: u64,
-    pathname: String,
+pub struct MemoryMapping {
+    pub start: u64,
+    pub end: u64,
+    pub permissions: String,
+    pub offset: u64,
+    pub device: String,
+    pub inode: u64,
+    pub pathname: String,
 }
 
 // Architecture-agnostic register printing
@@ -212,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let symbolize_start = Instant::now();
     
     let executable_path = format!("/proc/{pid}/exe");
-    let symbolizer = Symbolizer::new(&executable_path, pid)?;
+    let mut symbolizer = Symbolizer::new(&executable_path, pid)?;
     
     for (i, thread_info) in thread_infos.iter().enumerate() {
         println!("\n=== Thread {} (TID: {}, Name: '{}') ===", i + 1, thread_info.tid, thread_info.thread_name);
