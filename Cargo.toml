@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-addr2line = "0.25.0"
 backtrace = "0.3.75"
 gimli = "0.32.0"
 nix = { version = "0.30.1", features = ["ptrace"] }

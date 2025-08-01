@@ -1,11 +1,12 @@
-use std::path::Path;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio, Child};
+use std::sync::Mutex;
 
 use crate::SymbolizedFrame;
 
 pub struct Symbolizer {
-    loader: addr2line::Loader,
+    process: Mutex<Child>,
     base_address: u64,
 }
 
@@ -20,15 +21,32 @@ struct MemoryMapping {
 
 impl Symbolizer {
     pub fn new(executable_path: &str, pid: i32) -> Result<Self, Box<dyn std::error::Error>> {
-        // Create loader with the executable path
-        let loader = addr2line::Loader::new(Path::new(executable_path))?;
-        
         // Find the base address from /proc/PID/maps
         let base_address = Self::find_base_address(pid, executable_path)?;
         
         println!("Symbolizer: Found base address 0x{:x} for {}", base_address, executable_path);
         
-        Ok(Symbolizer { loader, base_address })
+        // Start addr2line process
+        let process = Command::new("addr2line")
+            .arg("-e")
+            .arg(executable_path)
+            .arg("-f")  // Include function names
+            .arg("-C")  // Demangle C++ names
+            .arg("-p")  // Pretty print (more readable format)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        
+        // Verify process started successfully
+        if process.stdin.is_none() || process.stdout.is_none() {
+            return Err("Failed to create pipes to addr2line process".into());
+        }
+        
+        Ok(Symbolizer { 
+            process: Mutex::new(process), 
+            base_address 
+        })
     }
     
     fn find_base_address(pid: i32, executable_path: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -101,52 +119,93 @@ impl Symbolizer {
             address
         };
 
-        // Try to find frames (handles inlined functions)
-        if let Ok(mut frames) = self.loader.find_frames(file_address) {
-            // Get the outermost (non-inlined) frame first
-            if let Ok(Some(frame)) = frames.next() {
-                // Get function name
-                if let Some(function) = frame.function {
-                    if let Ok(name) = function.demangle() {
-                        result.function_name = Some(name.to_string());
-                    } else if let Ok(raw_name) = function.raw_name() {
-                        result.function_name = Some(raw_name.to_string());
-                    }
-                } else {
-                    eprintln!("Failed to find function for address: 0x{:x}", address);
+        // Send address to addr2line and read response
+        if let Ok(mut process_guard) = self.process.lock() {
+            let process = &mut *process_guard;
+            
+            if let (Some(stdin), Some(stdout)) = (process.stdin.as_mut(), process.stdout.as_mut()) {
+                // Send the address
+                if let Err(e) = writeln!(stdin, "0x{:x}", file_address) {
+                    eprintln!("Failed to write address to addr2line: {}", e);
+                    result.function_name = Some(format!("<unknown_{:x}>", address));
+                    return result;
+                }
+                
+                if let Err(e) = stdin.flush() {
+                    eprintln!("Failed to flush stdin to addr2line: {}", e);
+                    result.function_name = Some(format!("<unknown_{:x}>", address));
+                    return result;
                 }
 
-                // Get location information
-                if let Some(location) = frame.location {
-                    if let Some(file) = location.file {
-                        result.file_name = Some(file.to_string());
+                // Read the response
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                
+                if let Ok(_) = reader.read_line(&mut line) {
+                    let line = line.trim();
+                    
+                    // Parse the response format: "function at file:line" or "?? ??:0"
+                    if line.contains(" at ") {
+                        let parts: Vec<&str> = line.splitn(2, " at ").collect();
+                        if parts.len() == 2 {
+                            let function_name = parts[0].trim();
+                            let location = parts[1].trim();
+                            
+                            // Set function name (skip if it's "??")
+                            if function_name != "??" {
+                                result.function_name = Some(function_name.to_string());
+                            }
+                            
+                            // Parse file:line
+                            if let Some(colon_pos) = location.rfind(':') {
+                                let file_part = &location[..colon_pos];
+                                let line_part = &location[colon_pos + 1..];
+                                
+                                if file_part != "??" {
+                                    result.file_name = Some(file_part.to_string());
+                                }
+                                
+                                if let Ok(line_num) = line_part.parse::<u32>() {
+                                    if line_num > 0 {
+                                        result.line_number = Some(line_num);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    result.line_number = location.line;
                 } else {
-                    eprintln!("Failed to find location for address: 0x{:x}", address);
+                    eprintln!("Failed to read response from addr2line for address: 0x{:x}", address);
                 }
             } else {
-                eprintln!("Failed to find next frame");
+                eprintln!("addr2line process pipes not available");
             }
         } else {
-            eprintln!("Failed to find frames for address: 0x{:x}", address);
-        }
-
-        // Fallback if frames lookup didn't work
-        if result.function_name.is_none() {
-            if let Ok(Some(location)) = self.loader.find_location(file_address) {
-                if let Some(file) = location.file {
-                    result.file_name = Some(file.to_string());
-                }
-                result.line_number = location.line;
-            }
+            eprintln!("Failed to lock addr2line process");
         }
 
         // If still no function name, provide a fallback
         if result.function_name.is_none() {
-            result.function_name = Some(format!("<unknown_{address:x}>"));
+            result.function_name = Some(format!("<unknown_{:x}>", address));
         }
 
         result
+    }
+}
+
+impl Drop for Symbolizer {
+    fn drop(&mut self) {
+        // Clean up the addr2line process
+        if let Ok(mut process_guard) = self.process.lock() {
+            let process = &mut *process_guard;
+            
+            // Close stdin to signal the process to exit
+            if let Some(mut stdin) = process.stdin.take() {
+                let _ = stdin.flush();
+                drop(stdin);
+            }
+            
+            // Try to terminate the process gracefully
+            let _ = process.wait();
+        }
     }
 }
