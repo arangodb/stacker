@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let symbolize_start = Instant::now();
     
     let executable_path = format!("/proc/{pid}/exe");
-    let symbolizer = Symbolizer::new(&executable_path)?;
+    let symbolizer = Symbolizer::new(&executable_path, pid)?;
     
     for (i, thread_info) in thread_infos.iter().enumerate() {
         println!("\n=== Thread {} (TID: {}) ===", i + 1, thread_info.tid);
