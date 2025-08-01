@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pid: i32 = args[1].parse()?;
-    println!("Attaching to process {}", pid);
+    println!("Attaching to process {pid}");
 
     let start_time = Instant::now();
     
@@ -69,13 +69,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let thread_infos = capture_all_threads(thread_ids)?;
     
     let capture_duration = start_time.elapsed();
-    println!("Process was stopped for: {:?}", capture_duration);
+    println!("Process was stopped for: {capture_duration:?}");
 
     // Step 3: Now we can take our time to symbolize the stack traces
     println!("\nSymbolizing stack traces...");
     let symbolize_start = Instant::now();
     
-    let executable_path = format!("/proc/{}/exe", pid);
+    let executable_path = format!("/proc/{pid}/exe");
     let symbolizer = Symbolizer::new(&executable_path)?;
     
     for (i, thread_info) in thread_infos.iter().enumerate() {
@@ -88,13 +88,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print!("  #{}: 0x{:016x}", frame_idx, sym_frame.address);
             
             if let Some(ref func_name) = sym_frame.function_name {
-                print!(" in {}", func_name);
+                print!(" in {func_name}");
             }
             
             if let Some(ref file_name) = sym_frame.file_name {
-                print!(" at {}", file_name);
+                print!(" at {file_name}");
                 if let Some(line_num) = sym_frame.line_number {
-                    print!(":{}", line_num);
+                    print!(":{line_num}");
                 }
             }
             
@@ -103,14 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     let symbolize_duration = symbolize_start.elapsed();
-    println!("\nSymbolization took: {:?}", symbolize_duration);
+    println!("\nSymbolization took: {symbolize_duration:?}");
     println!("Total time: {:?}", start_time.elapsed());
 
     Ok(())
 }
 
 fn discover_threads(pid: i32) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
-    let task_dir = format!("/proc/{}/task", pid);
+    let task_dir = format!("/proc/{pid}/task");
     let mut thread_ids = Vec::new();
     
     for entry in fs::read_dir(task_dir)? {
@@ -138,15 +138,15 @@ fn capture_all_threads(thread_ids: Vec<i32>) -> Result<Vec<ThreadInfo>, Box<dyn 
                         attached_tids.push(tid);
                     }
                     Ok(status) => {
-                        eprintln!("Unexpected wait status for TID {}: {:?}", tid, status);
+                        eprintln!("Unexpected wait status for TID {tid}: {status:?}");
                     }
                     Err(e) => {
-                        eprintln!("Failed to wait for TID {}: {}", tid, e);
+                        eprintln!("Failed to wait for TID {tid}: {e}");
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Failed to attach to TID {}: {}", tid, e);
+                eprintln!("Failed to attach to TID {tid}: {e}");
             }
         }
     }
@@ -161,7 +161,7 @@ fn capture_all_threads(thread_ids: Vec<i32>) -> Result<Vec<ThreadInfo>, Box<dyn 
     // Detach from all threads to resume the process
     for &tid in &attached_tids {
         if let Err(e) = ptrace::detach(Pid::from_raw(tid), None) {
-            eprintln!("Failed to detach from TID {}: {}", tid, e);
+            eprintln!("Failed to detach from TID {tid}: {e}");
         }
     }
     
