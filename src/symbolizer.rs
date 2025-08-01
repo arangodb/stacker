@@ -24,7 +24,7 @@ impl Symbolizer {
         // Find the base address from /proc/PID/maps
         let base_address = Self::find_base_address(pid, executable_path)?;
         
-        println!("Symbolizer: Found base address 0x{base_address:x} for {executable_path}");
+
         
         // Start addr2line process
         let process = Command::new("addr2line")

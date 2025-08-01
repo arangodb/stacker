@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
 use std::time::Instant;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 use nix::libc::{c_void, user_regs_struct};
 use nix::sys::ptrace;
@@ -36,6 +38,17 @@ struct SymbolizedFrame {
     function_name: Option<String>,
     file_name: Option<String>,
     line_number: Option<u32>,
+}
+
+#[derive(Debug)]
+struct MemoryMapping {
+    start: u64,
+    end: u64,
+    permissions: String,
+    offset: u64,
+    device: String,
+    inode: u64,
+    pathname: String,
 }
 
 // Architecture-agnostic register printing
@@ -106,6 +119,70 @@ fn print_arm64_registers(regs: &user_regs_struct) {
              regs.sp, regs.pc, regs.pstate);
 }
 
+fn parse_memory_mapping(line: &str) -> Option<MemoryMapping> {
+    // Format: address perms offset dev inode pathname
+    // Example: 559a9c400000-559a9c401000 r--p 00000000 103:02 2621487 /path/to/exe
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    
+    let address_range = parts[0];
+    let permissions = parts[1].to_string();
+    let offset_str = parts[2];
+    let device = parts[3].to_string();
+    let inode_str = parts[4];
+    let pathname = parts[5..].join(" ");
+    
+    // Parse address range
+    let addr_parts: Vec<&str> = address_range.split('-').collect();
+    if addr_parts.len() != 2 {
+        return None;
+    }
+    
+    let start = u64::from_str_radix(addr_parts[0], 16).ok()?;
+    let end = u64::from_str_radix(addr_parts[1], 16).ok()?;
+    let offset = u64::from_str_radix(offset_str, 16).ok()?;
+    let inode = inode_str.parse::<u64>().ok()?;
+    
+    Some(MemoryMapping {
+        start,
+        end,
+        permissions,
+        offset,
+        device,
+        inode,
+        pathname,
+    })
+}
+
+fn display_memory_maps(pid: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let maps_path = format!("/proc/{pid}/maps");
+    let file = File::open(&maps_path)?;
+    let reader = BufReader::new(file);
+    
+    println!("\n=== Memory Maps ===");
+    println!("Address Range          Perms  Offset     Device   Inode    Pathname");
+    println!("------------------     -----  --------   ------   -------  --------");
+    
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(mapping) = parse_memory_mapping(&line) {
+            println!("{:016x}-{:016x} {:5} {:08x}   {:6} {:>8}  {}",
+                mapping.start,
+                mapping.end,
+                mapping.permissions,
+                mapping.offset,
+                mapping.device,
+                mapping.inode,
+                if mapping.pathname.is_empty() { "[anonymous]" } else { &mapping.pathname }
+            );
+        }
+    }
+    
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -163,7 +240,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let symbolize_duration = symbolize_start.elapsed();
     println!("\nSymbolization took: {symbolize_duration:?}");
-    println!("Total time: {:?}", start_time.elapsed());
+    
+    // Display memory maps
+    if let Err(e) = display_memory_maps(pid) {
+        eprintln!("Failed to display memory maps: {e}");
+    }
+    
+    println!("\nTotal time: {:?}", start_time.elapsed());
 
     Ok(())
 }
