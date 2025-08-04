@@ -10,42 +10,55 @@ struct LibraryInfo {
     context: addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>,
     _file_data: &'static [u8],
     base_address: u64,
+    symbols: Vec<SymbolInfo>,   // sorted, addresses relative to base address!
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct SymbolInfo {
     name: String,
     address: u64,
     size: u64,
 }
 
+impl PartialOrd for SymbolInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SymbolInfo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.address.cmp(&other.address)
+    }
+}
+
 pub struct Symbolizer {
     main_context: addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>,
     _main_file_data: &'static [u8],
-    symbols: Vec<SymbolInfo>,
+    symbols: Vec<SymbolInfo>,    // sorted by address
     libraries: HashMap<String, LibraryInfo>,
     memory_maps: Vec<MemoryMapping>,
 }
 
 impl Symbolizer {
     pub fn new_from_data(executable_path: &str, memory_maps: &[MemoryMapping]) -> Result<Self, Box<dyn std::error::Error>> {
-        println!("Reading executable file...");
+        eprintln!("Reading executable file...");
         let file_data = fs::read(executable_path)?;
         
         // Leak the file data to get 'static lifetime
         // This is intentional - we need the data to live for the entire program duration
         let static_file_data: &'static [u8] = Box::leak(file_data.into_boxed_slice());
         
-        println!("Parsing object file...");
+        eprintln!("Parsing object file...");
         let object = object::File::parse(static_file_data)?;
         
-        println!("Loading debug sections and creating DWARF info...");
+        eprintln!("Loading debug sections and creating DWARF info...");
         let main_context = Self::create_context_from_object(&object)?;
 
-        println!("Load symbols from the main executable...");
+        eprintln!("Load symbols from the main executable...");
         let symbols = Self::load_symbols(&object)?;
 
-        println!("Using provided memory maps...");
+        eprintln!("Using provided memory maps...");
 
         Ok(Symbolizer {
             main_context,
@@ -115,40 +128,6 @@ impl Symbolizer {
         Ok(symbols)
     }
 
-    fn find_symbol_for_address(&self, address: u64) -> Option<&SymbolInfo> {
-        // Use binary search to find the symbol that contains this address
-        // Since symbols are sorted by address, we need to find the largest address <= target
-        match self.symbols.binary_search_by_key(&address, |s| s.address) {
-            Ok(index) => Some(&self.symbols[index]),
-            Err(insert_index) => {
-                if insert_index > 0 {
-                    let candidate = &self.symbols[insert_index - 1];
-                    // Check if the address falls within this symbol's range
-                    if candidate.size > 0 && address < candidate.address + candidate.size {
-                        Some(candidate)
-                    } else if candidate.size == 0 && address >= candidate.address {
-                        // For symbols with unknown size, assume they extend to the next symbol
-                        if insert_index < self.symbols.len() {
-                            let next_symbol = &self.symbols[insert_index];
-                            if address < next_symbol.address {
-                                Some(candidate)
-                            } else {
-                                None
-                            }
-                        } else {
-                            // Last symbol, assume it's valid
-                            Some(candidate)
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
     fn find_library_for_address(&self, address: u64) -> Option<&MemoryMapping> {
         self.memory_maps.iter().find(|mapping| {
             address >= mapping.start && address < mapping.end && 
@@ -164,11 +143,13 @@ impl Symbolizer {
             return Ok(());
         }
 
+        eprintln!("Loading library {path} at base address {base_address:x}...");
         // Try to read the library file
         let file_data = match fs::read(path) {
             Ok(data) => data,
-            Err(_) => {
+            Err(e) => {
                 // If we can't read the library, skip it
+                eprintln!("Could not load library file {path}, error: {e:?}!");
                 return Ok(());
             }
         };
@@ -187,11 +168,16 @@ impl Symbolizer {
             Err(_) => return Ok(()), // Skip if no debug info
         };
 
-        let lib_info = LibraryInfo {
+        let mut lib_info = LibraryInfo {
             context,
             _file_data: static_file_data,
             base_address,
+            symbols: vec![],
         };
+
+        eprintln!("Loading symbols for library {path}...");
+        let symbols = Self::load_symbols(&object)?;
+        lib_info.symbols = symbols;
 
         self.libraries.insert(path.to_string(), lib_info);
         Ok(())
@@ -227,6 +213,13 @@ impl Symbolizer {
                     if let Some(symbolized) = self.try_symbolize_with_context(&lib_info.context, relative_address, address) {
                         return symbolized;
                     }
+
+                    // Fall back to symbol table lookup
+                    if let Some(symbol) = find_symbol_for_address(&lib_info.symbols, address) {
+                        result.function_name = Some(symbol.name.clone());
+                        return result;
+                    }
+
                 }
             }
         }
@@ -237,7 +230,7 @@ impl Symbolizer {
         }
 
         // Fall back to symbol table lookup
-        if let Some(symbol) = self.find_symbol_for_address(address) {
+        if let Some(symbol) = find_symbol_for_address(&self.symbols, address) {
             result.function_name = Some(symbol.name.clone());
             return result;
         }
@@ -321,6 +314,40 @@ impl Symbolizer {
         }
 
         None
+    }
+}
+
+fn find_symbol_for_address(symbols: &Vec<SymbolInfo>, address: u64) -> Option<&SymbolInfo> {
+    // Use binary search to find the symbol that contains this address
+    // Since symbols are sorted by address, we need to find the largest address <= target
+    match symbols.binary_search_by_key(&address, |s| s.address) {
+        Ok(index) => Some(&symbols[index]),
+        Err(insert_index) => {
+            if insert_index > 0 {
+                let candidate = &symbols[insert_index - 1];
+                // Check if the address falls within this symbol's range
+                if candidate.size > 0 && address < candidate.address + candidate.size {
+                    Some(candidate)
+                } else if candidate.size == 0 && address >= candidate.address {
+                    // For symbols with unknown size, assume they extend to the next symbol
+                    if insert_index < symbols.len() {
+                        let next_symbol = &symbols[insert_index];
+                        if address < next_symbol.address {
+                            Some(candidate)
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Last symbol, assume it's valid
+                        Some(candidate)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
     }
 }
 
