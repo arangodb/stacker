@@ -1,8 +1,6 @@
 use std::borrow::Cow;
 use std::fs;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
 
@@ -30,32 +28,31 @@ pub struct Symbolizer {
 }
 
 impl Symbolizer {
-    pub fn new(executable_path: &str, pid: i32) -> Result<Self, Box<dyn std::error::Error>> {
-        // Read the executable file
+    pub fn new_from_data(executable_path: &str, memory_maps: &[MemoryMapping]) -> Result<Self, Box<dyn std::error::Error>> {
+        println!("Reading executable file...");
         let file_data = fs::read(executable_path)?;
         
         // Leak the file data to get 'static lifetime
         // This is intentional - we need the data to live for the entire program duration
         let static_file_data: &'static [u8] = Box::leak(file_data.into_boxed_slice());
         
-        // Parse the object file
+        println!("Parsing object file...");
         let object = object::File::parse(static_file_data)?;
         
-        // Load debug sections and create DWARF info
+        println!("Loading debug sections and creating DWARF info...");
         let main_context = Self::create_context_from_object(&object)?;
 
-        // Load symbols from the main executable
+        println!("Load symbols from the main executable...");
         let symbols = Self::load_symbols(&object)?;
 
-        // Parse memory maps to find shared libraries
-        let memory_maps = Self::parse_memory_maps(pid)?;
+        println!("Using provided memory maps...");
 
         Ok(Symbolizer {
             main_context,
             _main_file_data: static_file_data,
             symbols,
             libraries: HashMap::new(),
-            memory_maps,
+            memory_maps: memory_maps.to_vec(),
         })
     }
 
@@ -150,59 +147,6 @@ impl Symbolizer {
                 }
             }
         }
-    }
-
-    fn parse_memory_maps(pid: i32) -> Result<Vec<MemoryMapping>, Box<dyn std::error::Error>> {
-        let maps_path = format!("/proc/{pid}/maps");
-        let file = File::open(&maps_path)?;
-        let reader = BufReader::new(file);
-        
-        let mut mappings = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if let Some(mapping) = Self::parse_memory_mapping(&line) {
-                mappings.push(mapping);
-            }
-        }
-        
-        Ok(mappings)
-    }
-
-    fn parse_memory_mapping(line: &str) -> Option<MemoryMapping> {
-        // Format: address perms offset dev inode pathname
-        // Example: 559a9c400000-559a9c401000 r--p 00000000 103:02 2621487 /path/to/exe
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
-            return None;
-        }
-        
-        let address_range = parts[0];
-        let permissions = parts[1].to_string();
-        let offset_str = parts[2];
-        let device = parts[3].to_string();
-        let inode_str = parts[4];
-        let pathname = parts[5..].join(" ");
-        
-        // Parse address range
-        let addr_parts: Vec<&str> = address_range.split('-').collect();
-        if addr_parts.len() != 2 {
-            return None;
-        }
-        
-        let start = u64::from_str_radix(addr_parts[0], 16).ok()?;
-        let end = u64::from_str_radix(addr_parts[1], 16).ok()?;
-        let offset = u64::from_str_radix(offset_str, 16).ok()?;
-        let inode = inode_str.parse::<u64>().ok()?;
-        
-        Some(MemoryMapping {
-            start,
-            end,
-            permissions,
-            offset,
-            device,
-            inode,
-            pathname,
-        })
     }
 
     fn find_library_for_address(&self, address: u64) -> Option<&MemoryMapping> {

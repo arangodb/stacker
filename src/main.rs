@@ -1,13 +1,17 @@
-use std::env;
 use std::fs;
 use std::time::Instant;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 
 use nix::libc::{c_void, user_regs_struct};
 use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::Pid;
+
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 
 // Compile-time architecture verification
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -23,6 +27,118 @@ fn get_architecture_info() -> &'static str {
 
 mod symbolizer;
 use symbolizer::Symbolizer;
+
+#[derive(Parser)]
+#[command(name = "stacker")]
+#[command(about = "Multi-architecture stack tracer with two-phase operation")]
+#[command(version = "0.1.0")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Capture stack traces from a running process (Phase 1)
+    Capture {
+        /// Process ID to attach to
+        #[arg(short, long)]
+        pid: i32,
+        /// Output JSON file path
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Symbolize captured stack traces (Phase 2)
+    Symbolize {
+        /// Input JSON file from capture phase
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Path to the executable for symbolization
+        #[arg(short, long)]
+        executable: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SerializableRegisters {
+    #[cfg(target_arch = "x86_64")]
+    pub rax: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rbx: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rcx: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rdx: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rsi: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rdi: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rbp: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rsp: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r8: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r9: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r10: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r11: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r12: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r13: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r14: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub r15: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub rip: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub eflags: u64,
+    #[cfg(target_arch = "x86_64")]
+    pub cs: u16,
+    #[cfg(target_arch = "x86_64")]
+    pub ss: u16,
+    #[cfg(target_arch = "x86_64")]
+    pub ds: u16,
+    #[cfg(target_arch = "x86_64")]
+    pub es: u16,
+    #[cfg(target_arch = "x86_64")]
+    pub fs: u16,
+    #[cfg(target_arch = "x86_64")]
+    pub gs: u16,
+    #[cfg(target_arch = "x86_64")]
+    pub orig_rax: u64,
+
+    #[cfg(target_arch = "aarch64")]
+    pub regs: [u64; 31],
+    #[cfg(target_arch = "aarch64")]
+    pub sp: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub pc: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub pstate: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CapturedThreadInfo {
+    tid: i32,
+    thread_name: String,
+    registers: SerializableRegisters,
+    stack_trace: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CaptureData {
+    timestamp: DateTime<Utc>,
+    architecture: String,
+    process_id: i32,
+    executable_path: String,
+    memory_maps: Vec<MemoryMapping>,
+    threads: Vec<CapturedThreadInfo>,
+}
 
 #[derive(Debug, Clone)]
 struct ThreadInfo {
@@ -40,7 +156,7 @@ struct SymbolizedFrame {
     line_number: Option<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryMapping {
     pub start: u64,
     pub end: u64,
@@ -156,69 +272,236 @@ fn parse_memory_mapping(line: &str) -> Option<MemoryMapping> {
     })
 }
 
-fn display_memory_maps(pid: i32) -> Result<(), Box<dyn std::error::Error>> {
+fn parse_memory_maps(pid: i32) -> Result<Vec<MemoryMapping>, Box<dyn std::error::Error>> {
     let maps_path = format!("/proc/{pid}/maps");
     let file = File::open(&maps_path)?;
     let reader = BufReader::new(file);
     
+    let mut mappings = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(mapping) = parse_memory_mapping(&line) {
+            mappings.push(mapping);
+        }
+    }
+    
+    Ok(mappings)
+}
+
+fn display_memory_maps_from_data(mappings: &[MemoryMapping]) {
     println!("\n=== Memory Maps ===");
     println!("Address Range          Perms  Offset     Device   Inode    Pathname");
     println!("------------------     -----  --------   ------   -------  --------");
     
-    for line in reader.lines() {
-        let line = line?;
-        if let Some(mapping) = parse_memory_mapping(&line) {
-            println!("{:016x}-{:016x} {:5} {:08x}   {:6} {:>8}  {}",
-                mapping.start,
-                mapping.end,
-                mapping.permissions,
-                mapping.offset,
-                mapping.device,
-                mapping.inode,
-                if mapping.pathname.is_empty() { "[anonymous]" } else { &mapping.pathname }
-            );
+    for mapping in mappings {
+        println!("{:016x}-{:016x} {:5} {:08x}   {:6} {:>8}  {}",
+            mapping.start,
+            mapping.end,
+            mapping.permissions,
+            mapping.offset,
+            mapping.device,
+            mapping.inode,
+            if mapping.pathname.is_empty() { "[anonymous]" } else { &mapping.pathname }
+        );
+    }
+}
+
+// Convert user_regs_struct to SerializableRegisters
+impl From<user_regs_struct> for SerializableRegisters {
+    fn from(regs: user_regs_struct) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            SerializableRegisters {
+                rax: regs.rax,
+                rbx: regs.rbx,
+                rcx: regs.rcx,
+                rdx: regs.rdx,
+                rsi: regs.rsi,
+                rdi: regs.rdi,
+                rbp: regs.rbp,
+                rsp: regs.rsp,
+                r8: regs.r8,
+                r9: regs.r9,
+                r10: regs.r10,
+                r11: regs.r11,
+                r12: regs.r12,
+                r13: regs.r13,
+                r14: regs.r14,
+                r15: regs.r15,
+                rip: regs.rip,
+                eflags: regs.eflags,
+                cs: regs.cs as u16,
+                ss: regs.ss as u16,
+                ds: regs.ds as u16,
+                es: regs.es as u16,
+                fs: regs.fs as u16,
+                gs: regs.gs as u16,
+                orig_rax: regs.orig_rax,
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            SerializableRegisters {
+                regs: regs.regs,
+                sp: regs.sp,
+                pc: regs.pc,
+                pstate: regs.pstate,
+            }
         }
     }
-    
-    Ok(())
+}
+
+// Convert SerializableRegisters to user_regs_struct
+impl From<SerializableRegisters> for user_regs_struct {
+    fn from(regs: SerializableRegisters) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            user_regs_struct {
+                rax: regs.rax,
+                rbx: regs.rbx,
+                rcx: regs.rcx,
+                rdx: regs.rdx,
+                rsi: regs.rsi,
+                rdi: regs.rdi,
+                rbp: regs.rbp,
+                rsp: regs.rsp,
+                r8: regs.r8,
+                r9: regs.r9,
+                r10: regs.r10,
+                r11: regs.r11,
+                r12: regs.r12,
+                r13: regs.r13,
+                r14: regs.r14,
+                r15: regs.r15,
+                rip: regs.rip,
+                eflags: regs.eflags,
+                cs: regs.cs as u64,
+                ss: regs.ss as u64,
+                ds: regs.ds as u64,
+                es: regs.es as u64,
+                fs: regs.fs as u64,
+                gs: regs.gs as u64,
+                orig_rax: regs.orig_rax,
+                fs_base: 0,
+                gs_base: 0,
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            user_regs_struct {
+                regs: regs.regs,
+                sp: regs.sp,
+                pc: regs.pc,
+                pstate: regs.pstate,
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("Usage: {} <pid>", args[0]);
-        std::process::exit(1);
-    }
+    let cli = Cli::parse();
 
-    let pid: i32 = args[1].parse()?;
+    match cli.command {
+        Commands::Capture { pid, output } => {
+            capture_phase(pid, output)
+        }
+        Commands::Symbolize { input, executable } => {
+            symbolize_phase(input, executable)
+        }
+    }
+}
+
+fn capture_phase(pid: i32, output_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     println!("Stacker v0.1.0 - Multi-architecture stack tracer");
     println!("Target architecture: {}", get_architecture_info());
+    println!("=== CAPTURE PHASE ===");
     println!("Attaching to process {pid}");
 
     let start_time = Instant::now();
     
-    // Step 1: Discover all threads
+    // Step 1: Get executable path before we start
+    let executable_path = fs::read_link(format!("/proc/{pid}/exe"))?
+        .to_string_lossy()
+        .to_string();
+    println!("Executable: {executable_path}");
+    
+    // Step 2: Parse memory maps
+    let memory_maps = parse_memory_maps(pid)?;
+    
+    // Step 3: Discover all threads
     let thread_ids = discover_threads(pid)?;
     println!("Found {} threads", thread_ids.len());
 
-    // Step 2: Attach to all threads and capture stack traces quickly
+    // Step 4: Attach to all threads and capture stack traces quickly
     let thread_infos = capture_all_threads(pid, thread_ids)?;
     
     let capture_duration = start_time.elapsed();
     println!("Process was stopped for: {capture_duration:?}");
 
-    // Step 3: Now we can take our time to symbolize the stack traces
+    // Step 5: Convert to serializable format
+    let captured_threads: Vec<CapturedThreadInfo> = thread_infos
+        .into_iter()
+        .map(|thread| CapturedThreadInfo {
+            tid: thread.tid,
+            thread_name: thread.thread_name,
+            registers: thread.registers.into(),
+            stack_trace: thread.stack_trace,
+        })
+        .collect();
+
+    // Step 6: Create capture data structure
+    let capture_data = CaptureData {
+        timestamp: Utc::now(),
+        architecture: get_architecture_info().to_string(),
+        process_id: pid,
+        executable_path,
+        memory_maps,
+        threads: captured_threads,
+    };
+
+    // Step 7: Save to JSON file
+    let json_data = serde_json::to_string_pretty(&capture_data)?;
+    fs::write(&output_path, json_data)?;
+    
+    println!("Captured data saved to: {}", output_path.display());
+    println!("Total capture time: {:?}", start_time.elapsed());
+    println!("\nTo symbolize on another machine:");
+    println!("  stacker symbolize --input {} --executable /path/to/executable", output_path.display());
+
+    Ok(())
+}
+
+fn symbolize_phase(input_path: PathBuf, executable_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Stacker v0.1.0 - Multi-architecture stack tracer");
+    println!("=== SYMBOLIZE PHASE ===");
+    
+    // Step 1: Load capture data
+    println!("Loading capture data from: {}", input_path.display());
+    let json_data = fs::read_to_string(&input_path)?;
+    let capture_data: CaptureData = serde_json::from_str(&json_data)?;
+    
+    println!("Loaded capture from: {}", capture_data.timestamp);
+    println!("Target architecture: {}", capture_data.architecture);
+    println!("Original PID: {}", capture_data.process_id);
+    println!("Original executable: {}", capture_data.executable_path);
+    println!("Using executable: {}", executable_path.display());
+    
+    // Step 2: Create symbolizer using provided executable
     println!("\nSymbolizing stack traces...");
     let symbolize_start = Instant::now();
     
-    let executable_path = format!("/proc/{pid}/exe");
-    let mut symbolizer = Symbolizer::new(&executable_path, pid)?;
+    // Create a fake PID for the symbolizer (it only uses it for memory maps, which we have)
+    let mut symbolizer = Symbolizer::new_from_data(&executable_path.to_string_lossy(), &capture_data.memory_maps)?;
     
-    for (i, thread_info) in thread_infos.iter().enumerate() {
-        println!("\n=== Thread {} (TID: {}, Name: '{}') ===", i + 1, thread_info.tid, thread_info.thread_name);
-        print_registers(&thread_info.registers);
+    // Step 3: Symbolize each thread
+    for (i, captured_thread) in capture_data.threads.iter().enumerate() {
+        println!("\n=== Thread {} (TID: {}, Name: '{}') ===", i + 1, captured_thread.tid, captured_thread.thread_name);
         
-        for (frame_idx, &addr) in thread_info.stack_trace.iter().enumerate() {
+        // Convert back to user_regs_struct for printing
+        let registers: user_regs_struct = captured_thread.registers.clone().into();
+        print_registers(&registers);
+        
+        for (frame_idx, &addr) in captured_thread.stack_trace.iter().enumerate() {
             let sym_frame = symbolizer.symbolize(addr);
             
             print!("  #{}: 0x{:016x}", frame_idx, sym_frame.address);
@@ -242,11 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nSymbolization took: {symbolize_duration:?}");
     
     // Display memory maps
-    if let Err(e) = display_memory_maps(pid) {
-        eprintln!("Failed to display memory maps: {e}");
-    }
-    
-    println!("\nTotal time: {:?}", start_time.elapsed());
+    display_memory_maps_from_data(&capture_data.memory_maps);
 
     Ok(())
 }
