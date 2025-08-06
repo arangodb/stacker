@@ -9,7 +9,7 @@ use crate::{SymbolizedFrame, MemoryMapping};
 struct LibraryInfo {
     context: addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>,
     _file_data: &'static [u8],
-    base_address: u64,
+    _base_address: u64,
     symbols: Vec<SymbolInfo>,   // sorted, addresses relative to base address!
 }
 
@@ -38,10 +38,11 @@ pub struct Symbolizer {
     symbols: Vec<SymbolInfo>,    // sorted by address
     libraries: HashMap<String, LibraryInfo>,
     memory_maps: Vec<MemoryMapping>,
+    file_base_addresses: HashMap<String, u64>,
 }
 
 impl Symbolizer {
-    pub fn new_from_data(executable_path: &str, memory_maps: &[MemoryMapping]) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new_from_data(executable_path: &str, memory_maps: &[MemoryMapping], file_base_addresses: &HashMap<String, u64>) -> Result<Self, Box<dyn std::error::Error>> {
         eprintln!("Reading executable file...");
         let file_data = fs::read(executable_path)?;
         
@@ -66,6 +67,7 @@ impl Symbolizer {
             symbols,
             libraries: HashMap::new(),
             memory_maps: memory_maps.to_vec(),
+            file_base_addresses: file_base_addresses.clone(),
         })
     }
 
@@ -138,12 +140,15 @@ impl Symbolizer {
         })
     }
 
-    fn load_library(&mut self, path: &str, base_address: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn load_library(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
         if self.libraries.contains_key(path) {
             return Ok(());
         }
 
-        eprintln!("Loading library {path} at base address {base_address:x}...");
+        // Get the base address from our file_base_addresses mapping
+        let base_address = self.file_base_addresses.get(path).copied().unwrap_or(0);
+        eprintln!("Loading library {path} at file base address {base_address:x}...");
+        
         // Try to read the library file
         let file_data = match fs::read(path) {
             Ok(data) => data,
@@ -171,7 +176,7 @@ impl Symbolizer {
         let mut lib_info = LibraryInfo {
             context,
             _file_data: static_file_data,
-            base_address,
+            _base_address : base_address,
             symbols: vec![],
         };
 
@@ -193,31 +198,36 @@ impl Symbolizer {
 
         // For return addresses in stack traces, we usually want to subtract 1
         // to get the actual call site rather than the return address
-        let lookup_address = if address > 0 { address - 1 } else { address };
+        // let lookup_address = if address > 0 { address - 1 } else { address };
+        let lookup_address = address;
 
         // Try to find which library this address belongs to
         let mapping_info = self.find_library_for_address(address).map(|m| (m.pathname.clone(), m.start));
         
-        if let Some((pathname, base_addr)) = mapping_info {
+        if let Some((pathname, _)) = mapping_info {
             if !pathname.is_empty() && !pathname.starts_with('[') {
                 // This is a shared library - load it if we haven't already
-                if let Err(e) = self.load_library(&pathname, base_addr) {
+                if let Err(e) = self.load_library(&pathname) {
                     eprintln!("Failed to load library {pathname}: {e}");
                 }
                 
                 // Try to symbolize using the library
                 if let Some(lib_info) = self.libraries.get(&pathname) {
-                    // Adjust address relative to library base
-                    let relative_address = lookup_address - lib_info.base_address;
-                    
-                    if let Some(symbolized) = self.try_symbolize_with_context(&lib_info.context, relative_address, address) {
-                        return symbolized;
-                    }
+                    // Adjust address relative to library base (file start, not executable segment)
+                    if let Some(adr) = self.file_base_addresses.get(&pathname) {
+                        let relative_address = lookup_address - adr;
+                        
+                        if let Some(symbolized) = self.try_symbolize_with_context(&lib_info.context, relative_address, address) {
+                            return symbolized;
+                        }
 
-                    // Fall back to symbol table lookup
-                    if let Some(symbol) = find_symbol_for_address(&lib_info.symbols, address) {
-                        result.function_name = Some(symbol.name.clone());
-                        return result;
+                        // Fall back to symbol table lookup
+                        if let Some(symbol) = find_symbol_for_address(&lib_info.symbols, relative_address) {
+                            result.function_name = Some(symbol.name.clone());
+                            return result;
+                        }
+                    } else {
+                        eprintln!("Strange, address {address:x} is in mapping of {pathname} for which we do not find a base address, skipping...");
                     }
 
                 }
@@ -225,12 +235,24 @@ impl Symbolizer {
         }
         
         // Fall back to main executable
-        if let Some(symbolized) = self.try_symbolize_with_context(&self.main_context, lookup_address, address) {
+        // For main executable, try to find its base address in our mapping
+        // Look for a mapping that contains this address but isn't a library
+        let main_relative_address = if let Some(main_mapping) = self.find_library_for_address(address) {
+            if let Some(&main_exe_base) = self.file_base_addresses.get(&main_mapping.pathname) {
+                lookup_address - main_exe_base
+            } else {
+                lookup_address
+            }
+        } else {
+            lookup_address
+        };
+        
+        if let Some(symbolized) = self.try_symbolize_with_context(&self.main_context, main_relative_address, address) {
             return symbolized;
         }
 
-        // Fall back to symbol table lookup
-        if let Some(symbol) = find_symbol_for_address(&self.symbols, address) {
+        // Fall back to symbol table lookup for main executable
+        if let Some(symbol) = find_symbol_for_address(&self.symbols, main_relative_address) {
             result.function_name = Some(symbol.name.clone());
             return result;
         }
@@ -317,7 +339,7 @@ impl Symbolizer {
     }
 }
 
-fn find_symbol_for_address(symbols: &Vec<SymbolInfo>, address: u64) -> Option<&SymbolInfo> {
+fn find_symbol_for_address(symbols: &[SymbolInfo], address: u64) -> Option<&SymbolInfo> {
     // Use binary search to find the symbol that contains this address
     // Since symbols are sorted by address, we need to find the largest address <= target
     match symbols.binary_search_by_key(&address, |s| s.address) {

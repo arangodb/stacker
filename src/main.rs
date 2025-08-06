@@ -3,6 +3,7 @@ use std::time::Instant;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 use nix::libc::{c_void, user_regs_struct};
 use nix::sys::ptrace;
@@ -137,6 +138,7 @@ struct CaptureData {
     process_id: i32,
     executable_path: String,
     memory_maps: Vec<MemoryMapping>,
+    file_base_addresses: HashMap<String, u64>,
     threads: Vec<CapturedThreadInfo>,
 }
 
@@ -288,6 +290,24 @@ fn parse_memory_maps(pid: i32) -> Result<Vec<MemoryMapping>, Box<dyn std::error:
     Ok(mappings)
 }
 
+fn extract_file_base_addresses(memory_maps: &[MemoryMapping]) -> HashMap<String, u64> {
+    let mut file_base_addresses = HashMap::new();
+    
+    for mapping in memory_maps {
+        // Skip mappings with no filename or empty filename
+        if mapping.pathname.is_empty() || mapping.pathname.starts_with('[') {
+            continue;
+        }
+        
+        // Only insert if we haven't seen this file before (first mapping = base address)
+        if !file_base_addresses.contains_key(&mapping.pathname) {
+            file_base_addresses.insert(mapping.pathname.clone(), mapping.start);
+        }
+    }
+    
+    file_base_addresses
+}
+
 fn display_memory_maps_from_data(mappings: &[MemoryMapping]) {
     println!("\n=== Memory Maps ===");
     println!("Address Range          Perms  Offset     Device   Inode    Pathname");
@@ -428,17 +448,20 @@ fn capture_phase(pid: i32, output_path: PathBuf) -> Result<(), Box<dyn std::erro
     // Step 2: Parse memory maps
     let memory_maps = parse_memory_maps(pid)?;
     
-    // Step 3: Discover all threads
+    // Step 3: Extract file base addresses from memory maps
+    let file_base_addresses = extract_file_base_addresses(&memory_maps);
+    
+    // Step 4: Discover all threads
     let thread_ids = discover_threads(pid)?;
     println!("Found {} threads", thread_ids.len());
 
-    // Step 4: Attach to all threads and capture stack traces quickly
+    // Step 5: Attach to all threads and capture stack traces quickly
     let thread_infos = capture_all_threads(pid, thread_ids)?;
     
     let capture_duration = start_time.elapsed();
     println!("Process was stopped for: {capture_duration:?}");
 
-    // Step 5: Convert to serializable format
+    // Step 6: Convert to serializable format
     let captured_threads: Vec<CapturedThreadInfo> = thread_infos
         .into_iter()
         .map(|thread| CapturedThreadInfo {
@@ -449,17 +472,18 @@ fn capture_phase(pid: i32, output_path: PathBuf) -> Result<(), Box<dyn std::erro
         })
         .collect();
 
-    // Step 6: Create capture data structure
+    // Step 7: Create capture data structure
     let capture_data = CaptureData {
         timestamp: Utc::now(),
         architecture: get_architecture_info().to_string(),
         process_id: pid,
         executable_path,
         memory_maps,
+        file_base_addresses,
         threads: captured_threads,
     };
 
-    // Step 7: Save to JSON file
+    // Step 8: Save to JSON file
     let json_data = serde_json::to_string_pretty(&capture_data)?;
     fs::write(&output_path, json_data)?;
     
@@ -490,8 +514,8 @@ fn symbolize_phase(input_path: PathBuf, executable_path: PathBuf) -> Result<(), 
     println!("\nSymbolizing stack traces...");
     let symbolize_start = Instant::now();
     
-    // Create a fake PID for the symbolizer (it only uses it for memory maps, which we have)
-    let mut symbolizer = Symbolizer::new_from_data(&executable_path.to_string_lossy(), &capture_data.memory_maps)?;
+    // Create symbolizer with memory maps and file base addresses
+    let mut symbolizer = Symbolizer::new_from_data(&executable_path.to_string_lossy(), &capture_data.memory_maps, &capture_data.file_base_addresses)?;
     
     // Step 3: Symbolize each thread
     for (i, captured_thread) in capture_data.threads.iter().enumerate() {
