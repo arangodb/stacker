@@ -192,7 +192,7 @@ impl Symbolizer {
 
         // Get the base address from our file_base_addresses mapping
         let base_address = self.file_base_addresses.get(path).copied().unwrap_or(0);
-        eprintln!("Loading library {path} at file base address {base_address:x}...");
+        eprintln!("Loading library {path} at file base address 0x{base_address:x}...");
         
         // Try to read the library file
         let file_data = match fs::read(path) {
