@@ -1,16 +1,20 @@
 use std::borrow::Cow;
 use std::fs;
 use std::collections::HashMap;
+use std::path::Path;
 
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
 
 use crate::{SymbolizedFrame, MemoryMapping};
 
 struct LibraryInfo {
-    context: addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>,
+    loader: Option<addr2line::Loader>,
+    context: Option<addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>>,
     _file_data: &'static [u8],
     _base_address: u64,
     symbols: Vec<SymbolInfo>,   // sorted, addresses relative to base address!
+    #[allow(dead_code)]
+    build_id: Option<Vec<u8>>,  // Stored for potential future use and debugging
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -69,6 +73,47 @@ impl Symbolizer {
             memory_maps: memory_maps.to_vec(),
             file_base_addresses: file_base_addresses.clone(),
         })
+    }
+
+    fn extract_build_id(object: &object::File) -> Option<Vec<u8>> {
+        // Look for the .note.gnu.build-id section
+        if let Some(section) = object.section_by_name(".note.gnu.build-id") {
+            if let Ok(data) = section.uncompressed_data() {
+                // Parse the note structure
+                // Note header: namesz (4 bytes), descsz (4 bytes), type (4 bytes)
+                // Then name, then description (which contains the build-id)
+                if data.len() >= 16 {
+                    let namesz = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                    let descsz = u32::from_ne_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                    let note_type = u32::from_ne_bytes([data[8], data[9], data[10], data[11]]);
+                    
+                    // GNU build-id note type is 3
+                    if note_type == 3 && namesz == 4 {
+                        // Skip note header (12 bytes) and name ("GNU\0" = 4 bytes)
+                        let build_id_start = 16;
+                        if build_id_start + descsz <= data.len() {
+                            return Some(data[build_id_start..build_id_start + descsz].to_vec());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn get_debug_file_path(build_id: &[u8]) -> Option<String> {
+        if build_id.len() < 2 {
+            return None;
+        }
+        
+        // Convert build-id to hex string
+        let hex_string: String = build_id.iter().map(|b| format!("{b:02x}")).collect();
+        
+        // Split into first two hex digits and the rest
+        let (prefix, suffix) = hex_string.split_at(2);
+        
+        // Construct path: /usr/lib/debug/xy/name.debug
+        Some(format!("/usr/lib/debug/.build-id/{prefix}/{suffix}.debug"))
     }
 
     fn create_context_from_object(object: &object::File) -> Result<addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>, Box<dyn std::error::Error>> {
@@ -167,17 +212,52 @@ impl Symbolizer {
             Err(_) => return Ok(()), // Skip if we can't parse
         };
         
-        // Create context
-        let context = match Self::create_context_from_object(&object) {
-            Ok(ctx) => ctx,
-            Err(_) => return Ok(()), // Skip if no debug info
-        };
+        // Extract build-id from the library
+        let build_id = Self::extract_build_id(&object);
+        
+        let mut loader = None;
+        let mut context = None;
+        
+        // If we have a build-id, try to load debug info from the standard path
+        if let Some(ref build_id_bytes) = build_id {
+            if let Some(debug_path) = Self::get_debug_file_path(build_id_bytes) {
+                eprintln!("Trying to load debug info from: {debug_path}");
+                
+                // Try to create loader with debug file
+                if Path::new(&debug_path).exists() {
+                    match addr2line::Loader::new(&debug_path) {
+                        Ok(debug_loader) => {
+                            eprintln!("Successfully loaded debug info from {debug_path}");
+                            loader = Some(debug_loader);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to load debug info from {debug_path}: {e}");
+                        }
+                    }
+                } else {
+                    eprintln!("Debug file does not exist: {debug_path}");
+                }
+            }
+        }
+        
+        // If we couldn't load debug info from the standard path, fall back to the library itself
+        if loader.is_none() {
+            eprintln!("Falling back to loading debug info from library itself");
+            match Self::create_context_from_object(&object) {
+                Ok(ctx) => context = Some(ctx),
+                Err(_) => {
+                    eprintln!("No debug info available for library {path}");
+                }
+            }
+        }
 
         let mut lib_info = LibraryInfo {
+            loader,
             context,
             _file_data: static_file_data,
-            _base_address : base_address,
+            _base_address: base_address,
             symbols: vec![],
+            build_id,
         };
 
         eprintln!("Loading symbols for library {path}...");
@@ -217,8 +297,18 @@ impl Symbolizer {
                     if let Some(adr) = self.file_base_addresses.get(&pathname) {
                         let relative_address = lookup_address - adr;
                         
-                        if let Some(symbolized) = self.try_symbolize_with_context(&lib_info.context, relative_address, address) {
-                            return symbolized;
+                        // Try with loader first if available
+                        if let Some(ref loader) = lib_info.loader {
+                            if let Some(symbolized) = self.try_symbolize_with_loader(loader, relative_address, address) {
+                                return symbolized;
+                            }
+                        }
+                        
+                        // Fall back to context if available
+                        if let Some(ref context) = lib_info.context {
+                            if let Some(symbolized) = self.try_symbolize_with_context(context, relative_address, address) {
+                                return symbolized;
+                            }
                         }
 
                         // Fall back to symbol table lookup
@@ -260,6 +350,74 @@ impl Symbolizer {
         // If still no function name, provide a fallback
         result.function_name = Some(format!("<unknown_{address:x}>"));
         result
+    }
+
+    fn try_symbolize_with_loader(&self, loader: &addr2line::Loader, lookup_address: u64, original_address: u64) -> Option<SymbolizedFrame> {
+        let mut result = SymbolizedFrame {
+            address: original_address,
+            function_name: None,
+            file_name: None,
+            line_number: None,
+        };
+
+        // Try to find location information for this address
+        match loader.find_location(lookup_address) {
+            Ok(Some(location)) => {
+                // Extract file information
+                if let Some(file) = location.file {
+                    result.file_name = Some(file.to_string());
+                }
+                
+                // Extract line number
+                if let Some(line) = location.line {
+                    result.line_number = Some(line);
+                }
+            }
+            Ok(None) => {
+                // No location information found
+            }
+            Err(_) => {
+                // Error finding location - continue to try symbol lookup
+            }
+        }
+
+        // Try to find function information for this address using find_frames
+        match loader.find_frames(lookup_address) {
+            Ok(mut frames) => {
+                if let Ok(Some(frame)) = frames.next() {
+                    if let Some(function) = frame.function {
+                        // Get the raw function name
+                        let raw_name = function.raw_name().unwrap_or(std::borrow::Cow::Borrowed("<unknown>"));
+                        
+                        // Try to demangle the name
+                        let demangled_name = function.demangle().unwrap_or(raw_name);
+                        result.function_name = Some(demangled_name.to_string());
+                    }
+                    
+                    // If we didn't get location info before, try to get it from the frame
+                    if result.file_name.is_none() {
+                        if let Some(location) = frame.location {
+                            if let Some(file) = location.file {
+                                result.file_name = Some(file.to_string());
+                            }
+                            if let Some(line) = location.line {
+                                result.line_number = Some(line);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Error finding frames
+            }
+        }
+        
+        // Return the result if we found something
+        if result.function_name.is_some() || result.file_name.is_some() {
+            Some(result)
+        } else {
+            None
+        }
     }
 
     fn try_symbolize_with_context(&self, context: &addr2line::Context<gimli::EndianRcSlice<gimli::RunTimeEndian>>, lookup_address: u64, original_address: u64) -> Option<SymbolizedFrame> {
