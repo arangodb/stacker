@@ -342,7 +342,8 @@ impl Symbolizer {
         }
 
         // Fall back to symbol table lookup for main executable
-        if let Some(symbol) = find_symbol_for_address(&self.symbols, main_relative_address) {
+        //if let Some(symbol) = find_symbol_for_address(&self.symbols, main_relative_address) {
+        if let Some(symbol) = find_symbol_for_address(&self.symbols, address) {
             result.function_name = Some(symbol.name.clone());
             return result;
         }
