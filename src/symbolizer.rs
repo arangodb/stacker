@@ -276,9 +276,6 @@ impl Symbolizer {
             line_number: None,
         };
 
-        // For return addresses in stack traces, we usually want to subtract 1
-        // to get the actual call site rather than the return address
-        // let lookup_address = if address > 0 { address - 1 } else { address };
         let lookup_address = address;
 
         // Try to find which library this address belongs to
@@ -295,7 +292,7 @@ impl Symbolizer {
                 if let Some(lib_info) = self.libraries.get(&pathname) {
                     // Adjust address relative to library base (file start, not executable segment)
                     if let Some(adr) = self.file_base_addresses.get(&pathname) {
-                        let relative_address = lookup_address - adr;
+                        let relative_address = address - adr;
                         
                         // Try with loader first if available
                         if let Some(ref loader) = lib_info.loader {
@@ -312,7 +309,7 @@ impl Symbolizer {
                         }
 
                         // Fall back to symbol table lookup
-                        if let Some(symbol) = find_symbol_for_address(&lib_info.symbols, relative_address) {
+                        if let Some(symbol) = find_symbol_for_address(&lib_info.symbols, address) {
                             result.function_name = Some(symbol.name.clone());
                             return result;
                         }
@@ -329,12 +326,12 @@ impl Symbolizer {
         // Look for a mapping that contains this address but isn't a library
         let main_relative_address = if let Some(main_mapping) = self.find_library_for_address(address) {
             if let Some(&main_exe_base) = self.file_base_addresses.get(&main_mapping.pathname) {
-                lookup_address - main_exe_base
+                address - main_exe_base
             } else {
-                lookup_address
+                address
             }
         } else {
-            lookup_address
+            address
         };
         
         if let Some(symbolized) = self.try_symbolize_with_context(&self.main_context, main_relative_address, address) {
@@ -342,7 +339,6 @@ impl Symbolizer {
         }
 
         // Fall back to symbol table lookup for main executable
-        //if let Some(symbol) = find_symbol_for_address(&self.symbols, main_relative_address) {
         if let Some(symbol) = find_symbol_for_address(&self.symbols, address) {
             result.function_name = Some(symbol.name.clone());
             return result;
