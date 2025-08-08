@@ -32,17 +32,35 @@ The program will automatically compile with the appropriate architecture-specifi
 ## Usage
 
 ```bash
-./target/release/stacker <pid>
+stacker <SUBCOMMAND> [OPTIONS]
 ```
 
-Where `<pid>` is the process ID you want to trace.
+### Commands
 
-### Example
+- **capture**: Capture stack traces into a JSON file
+  - **options**: `--pid <pid>`, `--output <path>`
+  - **example**:
+    ```bash
+    stacker capture --pid 1234 --output capture.json
+    ```
 
-```bash
-# Trace process with PID 1234
-./target/release/stacker 1234
-```
+- **symbolize**: Symbolize a previously captured JSON file
+  - **options**: `--input <path>`, `--executable <path>`
+  - **example**:
+    ```bash
+    stacker symbolize --input capture.json --executable /proc/1234/exe
+    ```
+
+- **onephase**: Capture and symbolize in one go (no file I/O)
+  - **options**: `--pid <pid>`
+  - **example**:
+    ```bash
+    stacker onephase --pid 1234
+    ```
+
+#### Notes on symbolization
+
+- **Shared libraries and debug symbols**: If the traced process uses shared libraries, the exact libraries (and ideally their debug symbol packages) must be installed and discoverable during symbolization, especially when symbolizing on a different machine. Otherwise, symbol resolution may be incomplete or missing file/line information.
 
 ## Output
 
