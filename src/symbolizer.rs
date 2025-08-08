@@ -197,7 +197,7 @@ impl Symbolizer {
         // Try to read the library file
         let file_data = match fs::read(path) {
             Ok(data) => data,
-            Err(e) => {
+            Err(_e) => {
                 // If we can't read the library, skip it
                 // eprintln!("Could not load library file {path}, error: {e:?}!");
                 return Ok(());
@@ -276,7 +276,7 @@ impl Symbolizer {
             line_number: None,
         };
 
-        let lookup_address = address;
+        
 
         // Try to find which library this address belongs to
         let mapping_info = self.find_library_for_address(address).map(|m| (m.pathname.clone(), m.start));
