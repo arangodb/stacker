@@ -199,7 +199,7 @@ impl Symbolizer {
             Ok(data) => data,
             Err(e) => {
                 // If we can't read the library, skip it
-                eprintln!("Could not load library file {path}, error: {e:?}!");
+                // eprintln!("Could not load library file {path}, error: {e:?}!");
                 return Ok(());
             }
         };
