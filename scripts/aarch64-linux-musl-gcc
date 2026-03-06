@@ -1,0 +1,20 @@
+#!/bin/sh
+# Wrapper script: acts as a C linker/compiler for the aarch64-unknown-linux-musl
+# Rust target. Delegates to clang-19 with the right --target and sysroot so
+# that Cargo can cross-link a fully-static musl binary for aarch64.
+#
+# Requirements (Ubuntu 24.04):
+#   sudo apt-get install clang-19 lld-19 gcc-aarch64-linux-gnu
+#
+# The aarch64-linux-gnu sysroot supplies the C runtime startup objects
+# (crt1.o, crti.o, crtn.o) that musl needs at link time.  We point
+# clang at that sysroot and override the C library search with the musl
+# headers / static archive installed by musl-dev.
+
+MUSL_SYSROOT="${MUSL_SYSROOT:-/usr/aarch64-linux-gnu}"
+
+exec clang-19 \
+    --target=aarch64-linux-musl \
+    --sysroot="$MUSL_SYSROOT" \
+    -fuse-ld=lld-19 \
+    "$@"
